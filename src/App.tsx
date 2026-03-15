@@ -4,7 +4,10 @@ import sampleData from './data/sampleData'
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const NODE_RADIUS = 28
+const NODE_HALF_W = 44    // half-width  of node rectangle
+const NODE_HALF_H = 22    // half-height of node rectangle
+const NODE_CORNER = 6     // rounded-corner radius (world units)
+const PORT_PAD = 4        // vertical padding for port spread inside the rect
 const PARTICLE_COUNT = 3
 const EXT_DIST = 100      // distance of external placeholder from port
 const STATUS_COLORS: Record<string, string> = {
@@ -22,13 +25,7 @@ function wertigkeitColor(w: number): string {
   return '#94a3b8'
 }
 
-/** Spread `count` ports evenly across ±60° around a center angle */
-function portAngle(idx: number, count: number, center: number): number {
-  if (count <= 1) return center
-  return center + ((idx / (count - 1)) - 0.5) * (Math.PI / 1.5)
-}
-
-/** World position of a named port on the node's circle perimeter */
+/** World position of a named port on the left (input) or right (output) edge of the node rect */
 function portPos(
   node: NodeData,
   portName: string,
@@ -37,12 +34,15 @@ function portPos(
   const ports = ((direction === 'in' ? node.inputs : node.outputs) ?? [])
     .slice()
     .sort((a, b) => a.order - b.order)
-  const idx = ports.findIndex((p) => p.name === portName)
-  const center = direction === 'in' ? Math.PI : 0
-  const angle = portAngle(Math.max(0, idx), Math.max(1, ports.length), center)
+  // Fall back to index 0 when the port name isn't found (graceful degradation for unknown ports)
+  const rawIdx = ports.findIndex((p) => p.name === portName)
+  const idx = rawIdx === -1 ? 0 : rawIdx
+  const count = Math.max(1, ports.length)
+  const spread = (NODE_HALF_H - PORT_PAD) * 2
+  const yOffset = count <= 1 ? 0 : ((idx / (count - 1)) - 0.5) * spread
   return {
-    x: node.x + Math.cos(angle) * NODE_RADIUS,
-    y: node.y + Math.sin(angle) * NODE_RADIUS,
+    x: node.x + (direction === 'in' ? -NODE_HALF_W : NODE_HALF_W),
+    y: node.y + yOffset,
   }
 }
 
@@ -56,6 +56,23 @@ function extPos(
     x: connectedPos.x + Math.cos(angle) * EXT_DIST,
     y: connectedPos.y + Math.sin(angle) * EXT_DIST,
   }
+}
+
+/** Intersection of the ray (node.center → toX, toY) with the node rectangle border */
+function rectEdgePoint(
+  node: NodeData,
+  toX: number,
+  toY: number,
+): { x: number; y: number } {
+  const dx = toX - node.x
+  const dy = toY - node.y
+  if (Math.abs(dx) < 0.001 && Math.abs(dy) < 0.001) {
+    return { x: node.x + NODE_HALF_W, y: node.y }
+  }
+  const scaleX = dx !== 0 ? NODE_HALF_W / Math.abs(dx) : Infinity
+  const scaleY = dy !== 0 ? NODE_HALF_H / Math.abs(dy) : Infinity
+  const scale = Math.min(scaleX, scaleY)
+  return { x: node.x + dx * scale, y: node.y + dy * scale }
 }
 
 /** Compute the start and end world positions for a link, accounting for ports and external nodes */
@@ -80,12 +97,9 @@ function getLinkEndpoints(
     if (link.fromPort) {
       aAnchor = portPos(a, link.fromPort, 'out')
     } else {
-      const tx = b?.x ?? a.x + NODE_RADIUS
+      const tx = b?.x ?? a.x + NODE_HALF_W
       const ty = b?.y ?? a.y
-      const dx = tx - a.x
-      const dy = ty - a.y
-      const len = Math.sqrt(dx * dx + dy * dy) || 1
-      aAnchor = { x: a.x + (dx / len) * NODE_RADIUS, y: a.y + (dy / len) * NODE_RADIUS }
+      aAnchor = rectEdgePoint(a, tx, ty)
     }
   }
 
@@ -94,12 +108,9 @@ function getLinkEndpoints(
     if (link.toPort) {
       bAnchor = portPos(b, link.toPort, 'in')
     } else {
-      const sx = a?.x ?? b.x - NODE_RADIUS
+      const sx = a?.x ?? b.x - NODE_HALF_W
       const sy = a?.y ?? b.y
-      const dx = sx - b.x
-      const dy = sy - b.y
-      const len = Math.sqrt(dx * dx + dy * dy) || 1
-      bAnchor = { x: b.x + (dx / len) * NODE_RADIUS, y: b.y + (dy / len) * NODE_RADIUS }
+      bAnchor = rectEdgePoint(b, sx, sy)
     }
   }
 
@@ -304,8 +315,8 @@ export default function App() {
     const maxY = Math.max(...ys)
     const padW = canvas.clientWidth * 0.15
     const padH = canvas.clientHeight * 0.15
-    const dataW = maxX - minX + NODE_RADIUS * 4 + EXT_DIST * 2
-    const dataH = maxY - minY + NODE_RADIUS * 4 + EXT_DIST * 2
+    const dataW = maxX - minX + NODE_HALF_W * 4 + EXT_DIST * 2
+    const dataH = maxY - minY + NODE_HALF_H * 4 + EXT_DIST * 2
     const scaleX = (canvas.clientWidth - padW * 2) / (dataW || 1)
     const scaleY = (canvas.clientHeight - padH * 2) / (dataH || 1)
     const z = Math.min(scaleX, scaleY, 2.5)
@@ -373,11 +384,9 @@ export default function App() {
   })
 
   const hitTest = (wx: number, wy: number): NodeData | undefined =>
-    flowRef.current.nodes.find((n) => {
-      const dx = n.x - wx
-      const dy = n.y - wy
-      return dx * dx + dy * dy < NODE_RADIUS * NODE_RADIUS
-    })
+    flowRef.current.nodes.find((n) =>
+      Math.abs(n.x - wx) <= NODE_HALF_W && Math.abs(n.y - wy) <= NODE_HALF_H,
+    )
 
   const handleWheel = useCallback((e: WheelEvent) => {
     e.preventDefault()
@@ -560,6 +569,11 @@ export default function App() {
       // ── nodes ──────────────────────────────────────────────────────────
       nodes.forEach((node: NodeData) => {
         const isSel = selected?.id === node.id
+        const rx = node.x - NODE_HALF_W
+        const ry = node.y - NODE_HALF_H
+        const rw = NODE_HALF_W * 2
+        const rh = NODE_HALF_H * 2
+        const cr = NODE_CORNER / z
 
         if (isSel) {
           ctx.shadowColor = '#38bdf8'
@@ -567,7 +581,7 @@ export default function App() {
         }
 
         ctx.beginPath()
-        ctx.arc(node.x, node.y, NODE_RADIUS, 0, Math.PI * 2)
+        ctx.roundRect(rx, ry, rw, rh, cr)
         ctx.fillStyle = isSel ? '#1e40af' : '#1d4ed8'
         ctx.fill()
 
@@ -582,20 +596,13 @@ export default function App() {
         ctx.textBaseline = 'middle'
         ctx.fillText(node.id, node.x, node.y)
 
-        // Port dots
+        // Port dots on left (inputs) and right (outputs) edges
         const allPorts = [
           ...(node.inputs ?? []).map((p) => ({ ...p, dir: 'in' as const })),
           ...(node.outputs ?? []).map((p) => ({ ...p, dir: 'out' as const })),
         ]
         allPorts.forEach((port) => {
-          const sorted = (port.dir === 'in' ? node.inputs : node.outputs)!
-            .slice()
-            .sort((a, b) => a.order - b.order)
-          const idx = sorted.findIndex((p) => p.name === port.name)
-          const center = port.dir === 'in' ? Math.PI : 0
-          const angle = portAngle(idx, sorted.length, center)
-          const px = node.x + Math.cos(angle) * NODE_RADIUS
-          const py = node.y + Math.sin(angle) * NODE_RADIUS
+          const { x: px, y: py } = portPos(node, port.name, port.dir)
 
           ctx.beginPath()
           ctx.arc(px, py, 4 / z, 0, Math.PI * 2)
