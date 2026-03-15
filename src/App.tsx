@@ -1,11 +1,12 @@
 import { useRef, useEffect, useCallback, useState } from 'react'
-import { FlowData, NodeData, LinkData } from './types'
+import { FlowData, NodeData, LinkData, PortDef } from './types'
 import sampleData from './data/sampleData'
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const NODE_RADIUS = 28
 const PARTICLE_COUNT = 3
+const EXT_DIST = 100      // distance of external placeholder from port
 const STATUS_COLORS: Record<string, string> = {
   ok: '#22c55e',
   warning: '#f59e0b',
@@ -13,36 +14,250 @@ const STATUS_COLORS: Record<string, string> = {
   default: '#64748b',
 }
 
-// ─── Canvas rendering helpers ────────────────────────────────────────────────
+// ─── Port helpers ────────────────────────────────────────────────────────────
+
+function wertigkeitColor(w: number): string {
+  if (w >= 8) return '#22c55e'
+  if (w >= 5) return '#f59e0b'
+  return '#94a3b8'
+}
+
+/** Spread `count` ports evenly across ±60° around a center angle */
+function portAngle(idx: number, count: number, center: number): number {
+  if (count <= 1) return center
+  return center + ((idx / (count - 1)) - 0.5) * (Math.PI / 1.5)
+}
+
+/** World position of a named port on the node's circle perimeter */
+function portPos(
+  node: NodeData,
+  portName: string,
+  direction: 'in' | 'out',
+): { x: number; y: number } {
+  const ports = ((direction === 'in' ? node.inputs : node.outputs) ?? [])
+    .slice()
+    .sort((a, b) => a.order - b.order)
+  const idx = ports.findIndex((p) => p.name === portName)
+  const center = direction === 'in' ? Math.PI : 0
+  const angle = portAngle(Math.max(0, idx), Math.max(1, ports.length), center)
+  return {
+    x: node.x + Math.cos(angle) * NODE_RADIUS,
+    y: node.y + Math.sin(angle) * NODE_RADIUS,
+  }
+}
+
+/** Position of an external placeholder: EXT_DIST further outward from the port */
+function extPos(
+  refNode: NodeData,
+  connectedPos: { x: number; y: number },
+): { x: number; y: number } {
+  const angle = Math.atan2(connectedPos.y - refNode.y, connectedPos.x - refNode.x)
+  return {
+    x: connectedPos.x + Math.cos(angle) * EXT_DIST,
+    y: connectedPos.y + Math.sin(angle) * EXT_DIST,
+  }
+}
+
+/** Compute the start and end world positions for a link, accounting for ports and external nodes */
+function getLinkEndpoints(
+  link: LinkData,
+  nodeMap: Map<string, NodeData>,
+): {
+  start: { x: number; y: number }
+  end: { x: number; y: number }
+  isFromExt: boolean
+  isToExt: boolean
+} | null {
+  const isFromExt = link.from === '_external_'
+  const isToExt = link.to === '_external_'
+  const a = isFromExt ? null : nodeMap.get(link.from)
+  const b = isToExt ? null : nodeMap.get(link.to)
+  if (!isFromExt && !a) return null
+  if (!isToExt && !b) return null
+
+  let aAnchor: { x: number; y: number } | null = null
+  if (a) {
+    if (link.fromPort) {
+      aAnchor = portPos(a, link.fromPort, 'out')
+    } else {
+      const tx = b?.x ?? a.x + NODE_RADIUS
+      const ty = b?.y ?? a.y
+      const dx = tx - a.x
+      const dy = ty - a.y
+      const len = Math.sqrt(dx * dx + dy * dy) || 1
+      aAnchor = { x: a.x + (dx / len) * NODE_RADIUS, y: a.y + (dy / len) * NODE_RADIUS }
+    }
+  }
+
+  let bAnchor: { x: number; y: number } | null = null
+  if (b) {
+    if (link.toPort) {
+      bAnchor = portPos(b, link.toPort, 'in')
+    } else {
+      const sx = a?.x ?? b.x - NODE_RADIUS
+      const sy = a?.y ?? b.y
+      const dx = sx - b.x
+      const dy = sy - b.y
+      const len = Math.sqrt(dx * dx + dy * dy) || 1
+      bAnchor = { x: b.x + (dx / len) * NODE_RADIUS, y: b.y + (dy / len) * NODE_RADIUS }
+    }
+  }
+
+  if (isFromExt) {
+    const ep = extPos(b!, bAnchor!)
+    return { start: ep, end: bAnchor!, isFromExt: true, isToExt: false }
+  }
+  if (isToExt) {
+    const ep = extPos(a!, aAnchor!)
+    return { start: aAnchor!, end: ep, isFromExt: false, isToExt: true }
+  }
+  return { start: aAnchor!, end: bAnchor!, isFromExt: false, isToExt: false }
+}
+
+// ─── Canvas draw helpers ─────────────────────────────────────────────────────
 
 function statusColor(status?: string): string {
   return STATUS_COLORS[status ?? 'default'] ?? STATUS_COLORS['default']
 }
 
-function drawArrow(
+function drawArrowhead(
   ctx: CanvasRenderingContext2D,
-  x1: number,
-  y1: number,
-  x2: number,
-  y2: number,
+  from: { x: number; y: number },
+  to: { x: number; y: number },
   zoom: number,
 ) {
-  const dx = x2 - x1
-  const dy = y2 - y1
+  const dx = to.x - from.x
+  const dy = to.y - from.y
   const len = Math.sqrt(dx * dx + dy * dy)
   if (len < 1) return
   const ux = dx / len
   const uy = dy / len
-  const ex = x2 - ux * NODE_RADIUS
-  const ey = y2 - uy * NODE_RADIUS
-  const aLen = 10 / zoom
+  const aLen = 9 / zoom
   const aW = 5 / zoom
   ctx.beginPath()
-  ctx.moveTo(ex, ey)
-  ctx.lineTo(ex - ux * aLen + uy * aW, ey - uy * aLen - ux * aW)
-  ctx.lineTo(ex - ux * aLen - uy * aW, ey - uy * aLen + ux * aW)
+  ctx.moveTo(to.x, to.y)
+  ctx.lineTo(to.x - ux * aLen + uy * aW, to.y - uy * aLen - ux * aW)
+  ctx.lineTo(to.x - ux * aLen - uy * aW, to.y - uy * aLen + ux * aW)
   ctx.closePath()
   ctx.fill()
+}
+
+function drawDiamond(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  r: number,
+) {
+  ctx.beginPath()
+  ctx.moveTo(x, y - r)
+  ctx.lineTo(x + r, y)
+  ctx.lineTo(x, y + r)
+  ctx.lineTo(x - r, y)
+  ctx.closePath()
+}
+
+// ─── Small UI components ─────────────────────────────────────────────────────
+
+function WertigkeitBadge({ value }: { value: number }) {
+  const cls =
+    value >= 8
+      ? 'bg-green-900/60 text-green-400'
+      : value >= 5
+        ? 'bg-amber-900/60 text-amber-400'
+        : 'bg-slate-800 text-slate-400'
+  return (
+    <span
+      className={`inline-flex items-center justify-center w-5 h-5 rounded text-[10px] font-bold leading-none shrink-0 ${cls}`}
+      title="Wertigkeit (importance 1–10)"
+    >
+      {value}
+    </span>
+  )
+}
+
+function ThresholdBar({ rate, threshold }: { rate?: number; threshold?: number }) {
+  if (threshold === undefined || rate === undefined) return null
+  const pct = threshold > 0 ? Math.min(100, Math.round((rate / threshold) * 100)) : 100
+  const ok = rate >= threshold
+  return (
+    <div className="flex items-center gap-1 mt-0.5">
+      <div className="flex-1 h-1 bg-slate-700 rounded-full overflow-hidden">
+        <div
+          className={`h-full rounded-full ${ok ? 'bg-green-500' : 'bg-red-500'}`}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <span className={`text-[10px] font-mono w-7 text-right shrink-0 ${ok ? 'text-green-400' : 'text-red-400'}`}>
+        {pct}%
+      </span>
+    </div>
+  )
+}
+
+/** Sum of rates flowing into/out of a specific named port */
+function portCurrentRate(
+  portName: string,
+  nodeId: string,
+  direction: 'in' | 'out',
+  links: LinkData[],
+): number | undefined {
+  const matching = links.filter((l) =>
+    direction === 'in'
+      ? l.to === nodeId && l.toPort === portName
+      : l.from === nodeId && l.fromPort === portName,
+  )
+  const rates = matching.flatMap((l) => (l.rate !== undefined ? [l.rate] : []))
+  if (rates.length === 0) return undefined
+  return rates.reduce((a, b) => a + b, 0)
+}
+
+function PortSection({
+  ports,
+  direction,
+  nodeId,
+  links,
+}: {
+  ports: PortDef[]
+  direction: 'in' | 'out'
+  nodeId: string
+  links: LinkData[]
+}) {
+  const sorted = [...ports].sort((a, b) => a.order - b.order)
+  return (
+    <div>
+      <p className="text-xs font-medium text-slate-400 mb-1.5">
+        {direction === 'in' ? '← Inputs' : 'Outputs →'}
+      </p>
+      <div className="space-y-1.5">
+        {sorted.map((port) => {
+          const rate = portCurrentRate(port.name, nodeId, direction, links)
+          return (
+            <div key={port.name} className="bg-slate-950 rounded p-1.5 space-y-0.5">
+              <div className="flex items-center gap-1.5">
+                <WertigkeitBadge value={port.wertigkeit} />
+                <span className="text-xs font-medium text-slate-200 flex-1 truncate" title={port.name}>
+                  {port.name}
+                </span>
+                {rate !== undefined && (
+                  <span className="text-[11px] font-mono text-slate-300 shrink-0">
+                    {rate} <span className="text-slate-500">{port.unit ?? '/min'}</span>
+                  </span>
+                )}
+              </div>
+              {port.threshold !== undefined && (
+                <>
+                  <ThresholdBar rate={rate} threshold={port.threshold} />
+                  <p className="text-[10px] text-slate-500">
+                    min&nbsp;{port.threshold}&nbsp;{port.unit ?? '/min'}
+                  </p>
+                </>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
 }
 
 // ─── Main App ────────────────────────────────────────────────────────────────
@@ -69,7 +284,7 @@ export default function App() {
   const [loadError, setLoadError] = useState('')
   const [loadStatus, setLoadStatus] = useState('')
 
-  // keep ref in sync so canvas loop can read without closure stale issues
+  // keep ref in sync so canvas loop can read without stale closure issues
   useEffect(() => {
     flowRef.current = flowData
   }, [flowData])
@@ -89,8 +304,8 @@ export default function App() {
     const maxY = Math.max(...ys)
     const padW = canvas.clientWidth * 0.15
     const padH = canvas.clientHeight * 0.15
-    const dataW = maxX - minX + NODE_RADIUS * 4
-    const dataH = maxY - minY + NODE_RADIUS * 4
+    const dataW = maxX - minX + NODE_RADIUS * 4 + EXT_DIST * 2
+    const dataH = maxY - minY + NODE_RADIUS * 4 + EXT_DIST * 2
     const scaleX = (canvas.clientWidth - padW * 2) / (dataW || 1)
     const scaleY = (canvas.clientHeight - padH * 2) / (dataH || 1)
     const z = Math.min(scaleX, scaleY, 2.5)
@@ -150,20 +365,19 @@ export default function App() {
     }
   }
 
-  // ─── mouse / touch events ────────────────────────────────────────────────
+  // ─── mouse events ────────────────────────────────────────────────────────
 
   const screenToWorld = (sx: number, sy: number) => ({
     x: (sx - offsetRef.current.x) / zoomRef.current,
     y: (sy - offsetRef.current.y) / zoomRef.current,
   })
 
-  const hitTest = (wx: number, wy: number): NodeData | undefined => {
-    return flowRef.current.nodes.find((n) => {
+  const hitTest = (wx: number, wy: number): NodeData | undefined =>
+    flowRef.current.nodes.find((n) => {
       const dx = n.x - wx
       const dy = n.y - wy
       return dx * dx + dy * dy < NODE_RADIUS * NODE_RADIUS
     })
-  }
 
   const handleWheel = useCallback((e: WheelEvent) => {
     e.preventDefault()
@@ -201,17 +415,17 @@ export default function App() {
     draggingRef.current = false
   }, [])
 
-  const handleClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    const rect = canvas.getBoundingClientRect()
-    const sx = e.clientX - rect.left
-    const sy = e.clientY - rect.top
-    const world = screenToWorld(sx, sy)
-    const hit = hitTest(world.x, world.y)
-    setSelected(hit ?? null)
+  const handleClick = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      const canvas = canvasRef.current
+      if (!canvas) return
+      const rect = canvas.getBoundingClientRect()
+      const world = screenToWorld(e.clientX - rect.left, e.clientY - rect.top)
+      setSelected(hitTest(world.x, world.y) ?? null)
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+    [],
+  )
 
   // attach wheel with { passive: false } to allow preventDefault
   useEffect(() => {
@@ -253,94 +467,144 @@ export default function App() {
       ctx.clearRect(0, 0, canvas.width, canvas.height)
       ctx.setTransform(z, 0, 0, z, off.x, off.y)
 
-      // ── links ────────────────────────────────────────────────────────────
       const nodeMap = new Map(nodes.map((n) => [n.id, n]))
 
+      // ── links ──────────────────────────────────────────────────────────
       links.forEach((link: LinkData, idx: number) => {
-        const a = nodeMap.get(link.from)
-        const b = nodeMap.get(link.to)
-        if (!a || !b) return
+        const ep = getLinkEndpoints(link, nodeMap)
+        if (!ep) return
 
+        const { start, end, isFromExt, isToExt } = ep
         const color = link.color ?? statusColor(link.status)
 
-        // line from border of source to border of target
-        const dx = b.x - a.x
-        const dy = b.y - a.y
-        const len = Math.sqrt(dx * dx + dy * dy)
-        if (len < 1) return
-        const ux = dx / len
-        const uy = dy / len
-        const sx = a.x + ux * NODE_RADIUS
-        const sy = a.y + uy * NODE_RADIUS
+        // Line width from fromPort wertigkeit
+        const srcNode = nodeMap.get(link.from)
+        const fromPort = srcNode && link.fromPort
+          ? (srcNode.outputs ?? []).find((p) => p.name === link.fromPort)
+          : null
+        const lineW = fromPort ? 0.8 + (fromPort.wertigkeit - 1) * 0.22 : 1.5
 
         ctx.strokeStyle = color
-        ctx.lineWidth = 2 / z
-        ctx.globalAlpha = 0.55
+        ctx.lineWidth = lineW / z
+        ctx.globalAlpha = 0.6
+        if (isFromExt || isToExt) ctx.setLineDash([6 / z, 4 / z])
+
         ctx.beginPath()
-        ctx.moveTo(sx, sy)
-        ctx.lineTo(b.x - ux * NODE_RADIUS, b.y - uy * NODE_RADIUS)
+        ctx.moveTo(start.x, start.y)
+        ctx.lineTo(end.x, end.y)
         ctx.stroke()
 
-        // arrowhead
+        ctx.setLineDash([])
         ctx.globalAlpha = 1
-        ctx.fillStyle = color
-        drawArrow(ctx, a.x, a.y, b.x, b.y, z)
 
-        // animated particles
+        // Arrowhead at end
+        ctx.fillStyle = color
+        drawArrowhead(ctx, start, end, z)
+
+        // External diamond marker
+        if (isFromExt) {
+          drawDiamond(ctx, start.x, start.y, 7 / z)
+          ctx.fillStyle = '#334155'
+          ctx.fill()
+          ctx.strokeStyle = color
+          ctx.lineWidth = 1.5 / z
+          ctx.stroke()
+          ctx.fillStyle = '#94a3b8'
+          ctx.font = `${9 / z}px Inter,system-ui,sans-serif`
+          ctx.textAlign = 'center'
+          ctx.textBaseline = 'bottom'
+          ctx.fillText('Ext', start.x, start.y - 9 / z)
+        }
+        if (isToExt) {
+          drawDiamond(ctx, end.x, end.y, 7 / z)
+          ctx.fillStyle = '#334155'
+          ctx.fill()
+          ctx.strokeStyle = color
+          ctx.lineWidth = 1.5 / z
+          ctx.stroke()
+          ctx.fillStyle = '#94a3b8'
+          ctx.font = `${9 / z}px Inter,system-ui,sans-serif`
+          ctx.textAlign = 'center'
+          ctx.textBaseline = 'top'
+          ctx.fillText('Ext', end.x, end.y + 9 / z)
+        }
+
+        // Animated particles
+        ctx.globalAlpha = 0.85
         for (let p = 0; p < PARTICLE_COUNT; p++) {
           const phase = ((time / 900 + idx * 0.37 + p / PARTICLE_COUNT) % 1 + 1) % 1
-          const px = sx + (b.x - ux * NODE_RADIUS - sx) * phase
-          const py = sy + (b.y - uy * NODE_RADIUS - sy) * phase
+          const px = start.x + (end.x - start.x) * phase
+          const py = start.y + (end.y - start.y) * phase
           ctx.beginPath()
-          ctx.arc(px, py, 4 / z, 0, Math.PI * 2)
+          ctx.arc(px, py, 3.5 / z, 0, Math.PI * 2)
           ctx.fillStyle = color
-          ctx.globalAlpha = 0.9
           ctx.fill()
         }
         ctx.globalAlpha = 1
 
-        // rate label
-        if (link.rate !== undefined) {
-          const mx = (sx + b.x - ux * NODE_RADIUS) / 2
-          const my = (sy + b.y - uy * NODE_RADIUS) / 2
-          ctx.font = `${12 / z}px Inter,system-ui,sans-serif`
+        // Rate + port label
+        const mx = (start.x + end.x) / 2
+        const my = (start.y + end.y) / 2
+        const labelParts: string[] = []
+        if (link.fromPort) labelParts.push(link.fromPort)
+        if (link.rate !== undefined) labelParts.push(`${link.rate}/min`)
+        if (labelParts.length > 0) {
+          ctx.font = `${11 / z}px Inter,system-ui,sans-serif`
           ctx.fillStyle = '#94a3b8'
           ctx.textAlign = 'center'
           ctx.textBaseline = 'bottom'
-          ctx.fillText(`${link.rate}/min`, mx, my - 4 / z)
+          ctx.fillText(labelParts.join(' · '), mx, my - 4 / z)
         }
       })
 
-      // ── nodes ────────────────────────────────────────────────────────────
+      // ── nodes ──────────────────────────────────────────────────────────
       nodes.forEach((node: NodeData) => {
-        const isSel =
-          selected?.id === node.id
+        const isSel = selected?.id === node.id
 
-        // glow for selected
         if (isSel) {
           ctx.shadowColor = '#38bdf8'
           ctx.shadowBlur = 18 / z
         }
 
-        // circle fill
         ctx.beginPath()
         ctx.arc(node.x, node.y, NODE_RADIUS, 0, Math.PI * 2)
         ctx.fillStyle = isSel ? '#1e40af' : '#1d4ed8'
         ctx.fill()
 
-        // stroke
         ctx.lineWidth = 2 / z
         ctx.strokeStyle = isSel ? '#38bdf8' : '#60a5fa'
         ctx.stroke()
-
         ctx.shadowBlur = 0
 
-        // label
-        ctx.font = `bold ${12 / z}px Inter,system-ui,sans-serif`
+        ctx.font = `bold ${11 / z}px Inter,system-ui,sans-serif`
         ctx.fillStyle = '#e2e8f0'
         ctx.textAlign = 'center'
         ctx.textBaseline = 'middle'
         ctx.fillText(node.id, node.x, node.y)
+
+        // Port dots
+        const allPorts = [
+          ...(node.inputs ?? []).map((p) => ({ ...p, dir: 'in' as const })),
+          ...(node.outputs ?? []).map((p) => ({ ...p, dir: 'out' as const })),
+        ]
+        allPorts.forEach((port) => {
+          const sorted = (port.dir === 'in' ? node.inputs : node.outputs)!
+            .slice()
+            .sort((a, b) => a.order - b.order)
+          const idx = sorted.findIndex((p) => p.name === port.name)
+          const center = port.dir === 'in' ? Math.PI : 0
+          const angle = portAngle(idx, sorted.length, center)
+          const px = node.x + Math.cos(angle) * NODE_RADIUS
+          const py = node.y + Math.sin(angle) * NODE_RADIUS
+
+          ctx.beginPath()
+          ctx.arc(px, py, 4 / z, 0, Math.PI * 2)
+          ctx.fillStyle = wertigkeitColor(port.wertigkeit)
+          ctx.fill()
+          ctx.lineWidth = 1 / z
+          ctx.strokeStyle = '#0f172a'
+          ctx.stroke()
+        })
       })
 
       animRef.current = requestAnimationFrame(render)
@@ -350,14 +614,11 @@ export default function App() {
     return () => cancelAnimationFrame(animRef.current)
   }, [selected])
 
-  // ─── selected node detail helpers ────────────────────────────────────────
+  // ─── Side panel helpers ───────────────────────────────────────────────────
 
-  const inputs = selected
-    ? flowData.links.filter((l) => l.to === selected.id)
-    : []
-  const outputs = selected
-    ? flowData.links.filter((l) => l.from === selected.id)
-    : []
+  const simpleInputs = selected ? flowData.links.filter((l) => l.to === selected.id) : []
+  const simpleOutputs = selected ? flowData.links.filter((l) => l.from === selected.id) : []
+  const hasPorts = selected && ((selected.inputs?.length ?? 0) + (selected.outputs?.length ?? 0) > 0)
 
   // ─── render ──────────────────────────────────────────────────────────────
 
@@ -365,16 +626,16 @@ export default function App() {
     <div className="flex flex-col h-screen bg-slate-900 text-slate-100">
       {/* Header */}
       <header className="flex items-center justify-between px-4 py-2 bg-slate-950 border-b border-slate-800 shrink-0">
-        <h1 className="text-lg font-semibold tracking-tight text-sky-400">
-          AssemblyCockpit
-        </h1>
+        <h1 className="text-lg font-semibold tracking-tight text-sky-400">AssemblyCockpit</h1>
         <div className="flex items-center gap-2">
           <input
             className="w-72 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
             placeholder="Data URL (CORS-enabled)"
             value={dataUrl}
             onChange={(e) => setDataUrl(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') void handleLoadUrl() }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void handleLoadUrl()
+            }}
           />
           <button
             onClick={() => void handleLoadUrl()}
@@ -414,18 +675,21 @@ export default function App() {
         {/* Side panel */}
         <aside className="w-80 shrink-0 bg-slate-900 border-l border-slate-800 flex flex-col overflow-hidden">
           {/* Node details */}
-          <div className="p-3 border-b border-slate-800">
+          <div className="p-3 border-b border-slate-800 overflow-y-auto flex-1">
             <h2 className="text-xs font-semibold uppercase tracking-widest text-slate-400 mb-2">
               Selected system
             </h2>
+
             {selected ? (
-              <div className="space-y-2">
+              <div className="space-y-3">
                 <p className="font-semibold text-sky-400 text-sm">{selected.id}</p>
+
                 {selected.desc && (
-                  <p className="text-xs text-slate-300">{selected.desc}</p>
+                  <p className="text-xs text-slate-300 leading-relaxed">{selected.desc}</p>
                 )}
+
                 {selected.kpis && Object.keys(selected.kpis).length > 0 && (
-                  <div className="mt-1">
+                  <div>
                     <p className="text-xs font-medium text-slate-400 mb-1">KPIs</p>
                     <dl className="grid grid-cols-2 gap-x-2 gap-y-1">
                       {Object.entries(selected.kpis).map(([k, v]) => (
@@ -437,46 +701,70 @@ export default function App() {
                     </dl>
                   </div>
                 )}
-                <div className="flex gap-4 mt-1">
-                  <div>
-                    <p className="text-xs font-medium text-slate-400 mb-1">Inputs</p>
-                    {inputs.length ? (
-                      inputs.map((l) => (
-                        <div key={l.from} className="flex items-center gap-1 text-xs">
-                          <span
-                            className="inline-block w-2 h-2 rounded-full"
-                            style={{ background: statusColor(l.status) }}
-                          />
-                          <span className="text-slate-300">
-                            {l.from}
-                            {l.rate !== undefined ? ` · ${l.rate}/min` : ''}
-                          </span>
-                        </div>
-                      ))
-                    ) : (
-                      <span className="text-xs text-slate-500">—</span>
+
+                {/* Port-aware detail */}
+                {hasPorts ? (
+                  <div className="space-y-3">
+                    {selected.inputs && selected.inputs.length > 0 && (
+                      <PortSection
+                        ports={selected.inputs}
+                        direction="in"
+                        nodeId={selected.id}
+                        links={flowData.links}
+                      />
+                    )}
+                    {selected.outputs && selected.outputs.length > 0 && (
+                      <PortSection
+                        ports={selected.outputs}
+                        direction="out"
+                        nodeId={selected.id}
+                        links={flowData.links}
+                      />
                     )}
                   </div>
-                  <div>
-                    <p className="text-xs font-medium text-slate-400 mb-1">Outputs</p>
-                    {outputs.length ? (
-                      outputs.map((l) => (
-                        <div key={l.to} className="flex items-center gap-1 text-xs">
-                          <span
-                            className="inline-block w-2 h-2 rounded-full"
-                            style={{ background: statusColor(l.status) }}
-                          />
-                          <span className="text-slate-300">
-                            {l.to}
-                            {l.rate !== undefined ? ` · ${l.rate}/min` : ''}
-                          </span>
-                        </div>
-                      ))
-                    ) : (
-                      <span className="text-xs text-slate-500">—</span>
-                    )}
+                ) : (
+                  /* Fallback: simple link-based view (backward-compat for data without ports) */
+                  <div className="flex gap-4">
+                    <div>
+                      <p className="text-xs font-medium text-slate-400 mb-1">Inputs</p>
+                      {simpleInputs.length ? (
+                        simpleInputs.map((l) => (
+                          <div key={l.from} className="flex items-center gap-1 text-xs">
+                            <span
+                              className="inline-block w-2 h-2 rounded-full"
+                              style={{ background: statusColor(l.status) }}
+                            />
+                            <span className="text-slate-300">
+                              {l.from}
+                              {l.rate !== undefined ? ` · ${l.rate}/min` : ''}
+                            </span>
+                          </div>
+                        ))
+                      ) : (
+                        <span className="text-xs text-slate-500">—</span>
+                      )}
+                    </div>
+                    <div>
+                      <p className="text-xs font-medium text-slate-400 mb-1">Outputs</p>
+                      {simpleOutputs.length ? (
+                        simpleOutputs.map((l) => (
+                          <div key={l.to} className="flex items-center gap-1 text-xs">
+                            <span
+                              className="inline-block w-2 h-2 rounded-full"
+                              style={{ background: statusColor(l.status) }}
+                            />
+                            <span className="text-slate-300">
+                              {l.to}
+                              {l.rate !== undefined ? ` · ${l.rate}/min` : ''}
+                            </span>
+                          </div>
+                        ))
+                      ) : (
+                        <span className="text-xs text-slate-500">—</span>
+                      )}
+                    </div>
                   </div>
-                </div>
+                )}
               </div>
             ) : (
               <p className="text-xs text-slate-500">Click a node on the canvas…</p>
@@ -484,7 +772,7 @@ export default function App() {
           </div>
 
           {/* JSON editor */}
-          <div className="flex flex-col flex-1 p-3 overflow-hidden">
+          <div className="flex flex-col p-3 border-t border-slate-800 h-64 shrink-0">
             <h2 className="text-xs font-semibold uppercase tracking-widest text-slate-400 mb-2">
               Manual data (JSON)
             </h2>
